@@ -100,7 +100,7 @@ class Jablotron80ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 DEVICE_CONFIGURATION_REQUIRE_CODE_TO_ARM: cu.is_code_required_for_arm(),
                 DEVICE_CONFIGURATION_SYSTEM_MODE: cu.mode,
             }
-            cu.shutdown()
+            await cu.shutdown()
 
             if result:
                 self._devices = cu.devices

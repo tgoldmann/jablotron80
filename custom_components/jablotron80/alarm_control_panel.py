@@ -163,9 +163,9 @@ class Jablotron80AlarmControl(JablotronEntity, AlarmControlPanelEntity):
 
     async def async_alarm_trigger(self, code=None) -> None:
         if self.alarm_state == AlarmControlPanelState.DISARMED:
-            self._cu.send_keypress_sequence("*7" + self._cu._master_code, b"\xa1")
+            await self._cu.send_keypress_sequence("*7" + self._cu._master_code, b"\xa1")
         else:
-            self._cu.send_keypress_sequence("*7" + self._cu._master_code, b"\xa2")
+            await self._cu.send_keypress_sequence("*7" + self._cu._master_code, b"\xa2")
 
     async def async_alarm_arm_custom_bypass(self, code=None) -> None:
         raise NotImplementedError()

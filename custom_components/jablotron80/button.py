@@ -24,5 +24,5 @@ class JablotronQueryButtonEntity(JablotronEntity, ButtonEntity):
 
     async def async_press(self) -> None:
 
-        self._cu._send_device_query()
+        await self._cu._send_device_query()
         """Handle the button press."""

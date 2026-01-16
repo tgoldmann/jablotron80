@@ -77,7 +77,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
     options_update_unsubscriber = hass.data[DOMAIN][entry.entry_id][DATA_OPTIONS_UPDATE_UNSUBSCRIBER]
     options_update_unsubscriber()
     cu = hass.data[DOMAIN][entry.entry_id][DATA_JABLOTRON]
-    cu.shutdown()
+    await cu.shutdown()
     hass.data[DOMAIN].pop(entry.entry_id)
     return True
 
