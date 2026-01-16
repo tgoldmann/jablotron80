@@ -738,7 +738,11 @@ class JablotronConnection:
                     LOGGER.error("Not connected to JA80, abort")
                     return
 
-                records = await self._read_data()
+                try:
+                    records = await self._read_data()
+                except serial.serialutil.PortNotOpenError:
+                    await self.reconnect()
+
                 await self._forward_records(records)
                 send_cmd = await self._get_command()
 
