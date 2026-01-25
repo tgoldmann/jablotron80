@@ -678,11 +678,11 @@ class JablotronConnection:
     def device(self):
         return self._device
 
-    def disconnect(self) -> None:
+    async def disconnect(self) -> None:
         if self.is_connected():
             LOGGER.info("Disconnecting from JA80...")
-            self._connection.flush()
-            self._connection.close()
+            await asyncio.to_thread(self._connection.flush)
+            await asyncio.to_thread(self._connection.close)
             self._connection = None
         else:
             LOGGER.info("No need to disconnect; not connected")
@@ -690,8 +690,8 @@ class JablotronConnection:
     async def reconnect(self):
         LOGGER.warning("connection failed, reconnecting")
         await asyncio.sleep(1)
-        self.disconnect()
-        self.connect()
+        await self.disconnect()
+        await self.connect()
 
     def shutdown(self) -> None:
         self._stop.set()
@@ -738,7 +738,11 @@ class JablotronConnection:
                     LOGGER.error("Not connected to JA80, abort")
                     return
 
-                records = await self._read_data()
+                try:
+                    records = await self._read_data()
+                except serial.serialutil.PortNotOpenError:
+                    await self.reconnect()
+
                 await self._forward_records(records)
                 send_cmd = await self._get_command()
 
@@ -757,7 +761,7 @@ class JablotronConnection:
                             if send_cmd.code is not None:
                                 cmd = self._get_cmd(send_cmd.code[i].to_bytes(1, byteorder="big"))
                                 LOGGER.debug(f"Sending keypress, sequence:{i}")
-                                self._connection.write(cmd)  # ideally async
+                                await asyncio.to_thread(self._connection.write, cmd)
                                 LOGGER.debug(f"keypress sent, sequence:{i}")
 
                             found = await self.read_until_found(accepted_prefix)
@@ -794,7 +798,7 @@ class JablotronConnection:
 
             except Exception:
                 LOGGER.exception("Unexpected error in packet loop")
-        self.disconnect()
+        await self.disconnect()
 
     async def read_until_found(self, prefix: str, max_records: int = 10) -> bool:
         for i in range(max_records):
@@ -1505,8 +1509,8 @@ class JA80CentralUnit(object):
     async def initialize(self) -> None:
         global _loop
 
-        def shutdown_event(_):
-            self.shutdown()
+        async def shutdown_event(_):
+            await self.shutdown()
 
         LOGGER.info("initializing")
         await self._connection.connect()
@@ -2646,9 +2650,10 @@ class JA80CentralUnit(object):
             )
         )
 
-    def shutdown(self) -> None:
+    async def shutdown(self) -> None:
         self._connection.shutdown()
         self._stop.set()
+        await self._connection.disconnect()
 
     async def arm(self, code: str, zone: str = None) -> None:
         if zone is None:
