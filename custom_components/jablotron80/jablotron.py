@@ -15,6 +15,21 @@ LOGGER = logging.getLogger(__package__)
 expected_warning_level = logging.WARN
 verbose_connection_logging = False
 _loop = None  # global variable to store event loop
+_throttled_log_state = {}
+
+
+def _log_with_throttle(key: str, level: int, message: str, interval_seconds: float = 30.0) -> None:
+    now = time.monotonic()
+    state = _throttled_log_state.get(key)
+    if state is None or (now - state["ts"]) >= interval_seconds:
+        suppressed = 0 if state is None else state.get("suppressed", 0)
+        if suppressed:
+            LOGGER.log(level, f"{message} (suppressed {suppressed} similar messages)")
+        else:
+            LOGGER.log(level, message)
+        _throttled_log_state[key] = {"ts": now, "suppressed": 0}
+    else:
+        state["suppressed"] += 1
 
 
 from typing import Any, Dict, Optional, Union, Callable
@@ -666,6 +681,13 @@ class JablotronConnection:
         self._connection = None
         self._messages = asyncio.Event()
         self.update_devices = False
+        self._reconnect_lock = asyncio.Lock()
+        self._reconnect_attempt = 0
+        self._detail_log_window_start = 0.0
+        self._detail_log_count = 0
+        self._detail_log_suppressed = 0
+        self._reconnect_count = 0
+        self._reconnect_callbacks = set()
 
     def get_record(self) -> List[bytearray]:
         records = []
@@ -678,20 +700,48 @@ class JablotronConnection:
     def device(self):
         return self._device
 
+    @property
+    def reconnect_count(self) -> int:
+        return self._reconnect_count
+
+    def register_reconnect_callback(self, callback) -> None:
+        self._reconnect_callbacks.add(callback)
+
+    async def _publish_reconnect_update(self) -> None:
+        for callback in self._reconnect_callbacks:
+            try:
+                callback_result = callback(self._reconnect_count)
+                if asyncio.iscoroutine(callback_result):
+                    await callback_result
+            except Exception:
+                LOGGER.exception("Reconnect callback failed")
+
     async def disconnect(self) -> None:
         if self.is_connected():
             LOGGER.info("Disconnecting from JA80...")
-            await asyncio.to_thread(self._connection.flush)
-            await asyncio.to_thread(self._connection.close)
+            try:
+                await asyncio.to_thread(self._connection.flush)
+            except Exception:
+                LOGGER.debug("Ignoring flush error while disconnecting", exc_info=True)
+            try:
+                await asyncio.to_thread(self._connection.close)
+            except Exception:
+                LOGGER.debug("Ignoring close error while disconnecting", exc_info=True)
             self._connection = None
         else:
             LOGGER.info("No need to disconnect; not connected")
 
     async def reconnect(self):
-        LOGGER.warning("connection failed, reconnecting")
-        await asyncio.sleep(1)
-        await self.disconnect()
-        await self.connect()
+        async with self._reconnect_lock:
+            self._reconnect_attempt += 1
+            delay = min(30, 1 + self._reconnect_attempt)
+            LOGGER.warning(f"Connection failed, reconnecting in {delay}s (attempt {self._reconnect_attempt})")
+            await asyncio.sleep(delay)
+            await self.disconnect()
+            await self.connect()
+            self._reconnect_attempt = 0
+            self._reconnect_count += 1
+            await self._publish_reconnect_update()
 
     def shutdown(self) -> None:
         self._stop.set()
@@ -715,8 +765,22 @@ class JablotronConnection:
 
     def _log_detail(self, log: str):
         if verbose_connection_logging:
-            level = LOGGER.getEffectiveLevel()
-            LOGGER.log(level, log)
+            now = time.monotonic()
+            # Keep verbose transport logs useful without flooding Home Assistant logs.
+            if self._detail_log_window_start == 0 or (now - self._detail_log_window_start) >= 60:
+                if self._detail_log_suppressed:
+                    LOGGER.debug(
+                        f"Suppressed {self._detail_log_suppressed} verbose connection logs in previous 60s window"
+                    )
+                self._detail_log_window_start = now
+                self._detail_log_count = 0
+                self._detail_log_suppressed = 0
+
+            if self._detail_log_count < 200:
+                LOGGER.debug(log)
+                self._detail_log_count += 1
+            else:
+                self._detail_log_suppressed += 1
 
     def connect(self) -> None:
         raise NotImplementedError
@@ -735,15 +799,18 @@ class JablotronConnection:
         while not self._stop.is_set() or not self._cmd_q.empty():
             try:
                 if not self.is_connected():
-                    LOGGER.error("Not connected to JA80, abort")
-                    return
+                    await self.reconnect()
+                    continue
 
                 try:
                     records = await self._read_data()
-                except serial.serialutil.PortNotOpenError:
+                except (serial.SerialException, serial.serialutil.PortNotOpenError, OSError) as ex:
+                    LOGGER.warning(f"Read error from JA80 connection: {ex}")
                     await self.reconnect()
+                    continue
 
-                await self._forward_records(records)
+                if records:
+                    await self._forward_records(records)
                 send_cmd = await self._get_command()
 
                 if send_cmd is not None:
@@ -771,7 +838,12 @@ class JablotronConnection:
                             else:
                                 if retries == 0:
                                     level = logging.WARN
-                                LOGGER.log(level, f"no accepted message for sequence:{i} received")
+                                _log_with_throttle(
+                                    f"no_accept_seq_{i}",
+                                    level,
+                                    f"no accepted message for sequence:{i} received",
+                                    interval_seconds=30.0,
+                                )
                                 accepted = False
                                 break
 
@@ -803,7 +875,8 @@ class JablotronConnection:
     async def read_until_found(self, prefix: str, max_records: int = 10) -> bool:
         for i in range(max_records):
             records_tmp = await self._read_data()
-            await self._forward_records(records_tmp)
+            if records_tmp:
+                await self._forward_records(records_tmp)
             for record in records_tmp:
                 LOGGER.debug(f"record:{i}:{format_packet(record)}")
                 if record[: len(prefix)] == prefix:
@@ -895,13 +968,15 @@ class JablotronConnectionSerial(JablotronConnection):
         data = b""
 
         while data == b"":
-            data = await asyncio.to_thread(self._connection.read_until, b"\xff")
+            try:
+                data = await asyncio.to_thread(self._connection.read_until, b"\xff")
+            except (serial.SerialException, OSError):
+                await self.reconnect()
+                return []
 
             if data == b"":
-                await self.reconnect()
-                await asyncio.to_thread(
-                    self._connection.read_until, b"\xff"
-                )  # discard first potentially corrupt record
+                # Serial timeout with no data is expected. Keep waiting.
+                await asyncio.sleep(0.05)
 
         self._log_detail(f"received record: {format_packet(data)}")
         ret_val.append(data)
@@ -1147,7 +1222,12 @@ class JablotronMessage:
             )
         else:
             if not JablotronMessage.check_crc(record):
-                LOGGER.log(expected_warning_level, f"Invalid CRC for {packet_data}")
+                _log_with_throttle(
+                    "invalid_crc",
+                    expected_warning_level,
+                    f"Invalid CRC for {packet_data}",
+                    interval_seconds=30.0,
+                )
             elif JablotronMessage.validate_length(message_type, record):
                 LOGGER.debug(f"Message of type {message_type} received {packet_data}")
                 return message_type
@@ -1450,6 +1530,12 @@ class JA80CentralUnit(object):
         self._query.name = f"{CENTRAL_UNIT_MODEL} Query Button"
         self._query.type = "button"
 
+        self._reconnect_count_sensor = JablotronSensor(5)
+        self._reconnect_count_sensor.name = f"{CENTRAL_UNIT_MODEL} Reconnect Count"
+        self._reconnect_count_sensor.manufacturer = MANUFACTURER
+        self._reconnect_count_sensor.type = "diagnostic"
+        self._connection.register_reconnect_callback(self._on_reconnect_count_changed)
+
         self._active_devices = {}
         self._active_codes = {}
         self._codes = {}
@@ -1635,6 +1721,21 @@ class JA80CentralUnit(object):
     @property
     def query(self) -> JablotronButton:
         return self._query
+
+    @property
+    def reconnect_count_sensor(self) -> JablotronSensor:
+        return self._reconnect_count_sensor
+
+    @property
+    def reconnect_count(self) -> int:
+        return int(self._reconnect_count_sensor.value)
+
+    @reconnect_count.setter
+    def reconnect_count(self, reconnect_count: int) -> None:
+        self._reconnect_count_sensor.value = reconnect_count
+
+    async def _on_reconnect_count_changed(self, reconnect_count: int) -> None:
+        self.reconnect_count = reconnect_count
 
     @property
     def system_status(self) -> str:

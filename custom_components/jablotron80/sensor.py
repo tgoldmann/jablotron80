@@ -12,7 +12,8 @@ from .jablotronHA import JablotronEntity
 from typing import Optional
 from .const import DATA_JABLOTRON, DOMAIN
 
-from homeassistant.components.sensor import SensorDeviceClass
+from homeassistant.components.sensor import SensorDeviceClass, SensorStateClass
+from homeassistant.helpers.entity import EntityCategory
 
 import logging
 
@@ -24,6 +25,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
     async_add_entities([JablotronZoneSensorEntity(zone, cu) for zone in cu.zones], True)
     async_add_entities([JablotronSignalEntity(cu.rf_level, cu)], True)
     async_add_entities([JablotronSensorEntity(cu.alert, cu)], True)
+    async_add_entities([JablotronReconnectCountEntity(cu.reconnect_count_sensor, cu)], True)
 
 
 class JablotronZoneSensorEntity(JablotronEntity):
@@ -73,3 +75,24 @@ class JablotronSignalEntity(JablotronSensorEntity):
     @property
     def device_class(self) -> str:
         return SensorDeviceClass.SIGNAL_STRENGTH
+
+
+class JablotronReconnectCountEntity(JablotronSensorEntity):
+    def __init__(self, sensor: JablotronSensor, cu: JA80CentralUnit) -> None:
+        super().__init__(sensor, cu)
+
+    @property
+    def state(self) -> int:
+        return int(self._object.value)
+
+    @property
+    def icon(self) -> Optional[str]:
+        return "mdi:connection"
+
+    @property
+    def entity_category(self) -> EntityCategory:
+        return EntityCategory.DIAGNOSTIC
+
+    @property
+    def state_class(self) -> str:
+        return SensorStateClass.TOTAL_INCREASING
